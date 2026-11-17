@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/pion/rtcp"
+	"github.com/pion/transport/v5/packetio"
 	"github.com/pion/transport/v5/test"
 	"github.com/stretchr/testify/assert"
 )
@@ -902,6 +903,370 @@ func TestSessionSRTCPReadWriteDoesNotAllocate(t *testing.T) {
 			assert.NoError(t, bReadStream.Close())
 		})
 	}
+}
+
+// TestSessionSRTCPRejectedPacketKeepsReplayWindow verifies that a datagram that
+// fails authentication is rejected before it can consume the replay window of an
+// already established stream. The control message it carried must never be
+// delivered, while the legitimate retransmission of the same index must still be
+// accepted.
+func TestSessionSRTCPRejectedPacketKeepsReplayWindow(t *testing.T) {
+	lim := test.TimeOut(time.Second * 5)
+	defer lim.Stop()
+
+	report := test.CheckRoutines(t)
+	defer report()
+
+	aSession, bSession := buildSessionSRTCPPair(t)
+
+	bReadStream, err := bSession.OpenReadStream(5000)
+	assert.NoError(t, err)
+
+	encrypted, err := encryptSRTCP(aSession.session.localContext,
+		&rtcp.PictureLossIndication{MediaSSRC: 5000})
+	assert.NoError(t, err)
+
+	tampered := make([]byte, len(encrypted))
+	copy(tampered, encrypted)
+	tampered[len(tampered)-1] ^= 0xFF // corrupt the auth tag
+
+	assert.Error(t, bSession.decrypt(tampered, nil),
+		"a datagram with an invalid auth tag must be rejected")
+	assert.NoError(t, bSession.decrypt(encrypted, nil),
+		"rejecting an unauthenticated datagram must not consume the replay window")
+
+	readBuffer := make([]byte, 200)
+	n, err := bReadStream.Read(readBuffer)
+	assert.NoError(t, err)
+	assert.Equal(t, encryptedPayloadLength(t, encrypted), n)
+
+	assert.NoError(t, aSession.Close())
+	assert.NoError(t, bSession.Close())
+}
+
+// TestSessionSRTCPUnknownControlNotDeliveredWithoutDestination verifies that a
+// control packet without any destination is not turned into trusted traffic. A
+// datagram that only contains such a packet has nothing to scope it to, so it
+// must neither create a stream nor notify AcceptStream.
+func TestSessionSRTCPUnknownControlNotDeliveredWithoutDestination(t *testing.T) {
+	lim := test.TimeOut(time.Second * 5)
+	defer lim.Stop()
+
+	report := test.CheckRoutines(t)
+	defer report()
+
+	aSession, bSession := buildSessionSRTCPPair(t)
+
+	// Packet type 221 is unknown to pion/rtcp and is parsed as rtcp.RawPacket,
+	// which reports no destination SSRC of its own.
+	unknown := []byte{0x80, 0xdd, 0x00, 0x01, 0x01, 0x02, 0x03, 0x04}
+	encrypted, err := aSession.session.localContext.EncryptRTCP(nil, unknown, nil)
+	assert.NoError(t, err)
+	assert.NoError(t, bSession.decrypt(encrypted, nil))
+
+	bSession.session.readStreamsLock.Lock()
+	streamCount := len(bSession.session.readStreams)
+	bSession.session.readStreamsLock.Unlock()
+	assert.Zero(t, streamCount,
+		"an unknown control packet must not establish a stream on its own")
+
+	assert.NoError(t, aSession.Close())
+	assert.NoError(t, bSession.Close())
+}
+
+// TestSessionSRTCPUnknownControlScopedToCompound verifies that an authenticated
+// unknown control packet is delivered only to the streams its compound datagram
+// is addressed to, and that it is not duplicated across unrelated SSRCs.
+func TestSessionSRTCPUnknownControlScopedToCompound(t *testing.T) {
+	lim := test.TimeOut(time.Second * 5)
+	defer lim.Stop()
+
+	report := test.CheckRoutines(t)
+	defer report()
+
+	aSession, bSession := buildSessionSRTCPPair(t)
+
+	reportStream, err := bSession.OpenReadStream(5000)
+	assert.NoError(t, err)
+	unrelatedStream, err := bSession.OpenReadStream(7000)
+	assert.NoError(t, err)
+
+	pli, err := (&rtcp.PictureLossIndication{MediaSSRC: 5000}).Marshal()
+	assert.NoError(t, err)
+	unknown := []byte{0x80, 0xdd, 0x00, 0x01, 0x01, 0x02, 0x03, 0x04}
+	compound := append(append([]byte{}, pli...), unknown...)
+
+	encrypted, err := aSession.session.localContext.EncryptRTCP(nil, compound, nil)
+	assert.NoError(t, err)
+	assert.NoError(t, bSession.decrypt(encrypted, nil))
+
+	assert.NoError(t, reportStream.Close())
+	assert.NoError(t, unrelatedStream.Close())
+
+	readBuffer := make([]byte, 200)
+	for _, expected := range [][]byte{pli, unknown} {
+		n, readErr := reportStream.Read(readBuffer)
+		assert.NoError(t, readErr)
+		assert.Equal(t, expected, readBuffer[:n])
+	}
+	_, err = reportStream.Read(readBuffer)
+	assert.ErrorIs(t, err, io.EOF)
+
+	_, err = unrelatedStream.Read(readBuffer)
+	assert.ErrorIs(t, err, io.EOF,
+		"the unknown control packet must not be fanned out to unrelated streams")
+
+	assert.NoError(t, aSession.Close())
+	assert.NoError(t, bSession.Close())
+}
+
+// TestSessionSRTCPMalformedControlRejectedAsWhole verifies that a compound
+// datagram carrying an unparsable control packet still delivers its valid
+// packets, and that the malformed packet itself is never forwarded as trusted
+// control information to any stream.
+func TestSessionSRTCPMalformedControlRejectedAsWhole(t *testing.T) {
+	lim := test.TimeOut(time.Second * 5)
+	defer lim.Stop()
+
+	report := test.CheckRoutines(t)
+	defer report()
+
+	// Valid framing, but the CNAME length exceeds the packet. Parsing appends
+	// SSRC 6000 before discovering the malformed item.
+	invalidSDES := []byte{
+		0x81, 0xca, 0x00, 0x02,
+		0x00, 0x00, 0x17, 0x70,
+		0x01, 0xff, 0x00, 0x00,
+	}
+	pli, err := (&rtcp.PictureLossIndication{MediaSSRC: 5000}).Marshal()
+	assert.NoError(t, err)
+
+	aSession, bSession := buildSessionSRTCPPair(t)
+
+	legitStream, err := bSession.OpenReadStream(5000)
+	assert.NoError(t, err)
+	// Pre-open the SSRC the malformed packet would partially report, so
+	// leaking a delivery to it is observable instead of blocking.
+	partialStream, err := bSession.OpenReadStream(6000)
+	assert.NoError(t, err)
+
+	compound := append(append([]byte{}, invalidSDES...), pli...)
+	encrypted, err := aSession.session.localContext.EncryptRTCP(nil, compound, nil)
+	assert.NoError(t, err)
+	assert.Error(t, bSession.decrypt(encrypted, nil),
+		"the malformed control packet must be reported")
+
+	assert.NoError(t, legitStream.Close())
+	assert.NoError(t, partialStream.Close())
+
+	readBuffer := make([]byte, 200)
+	n, err := legitStream.Read(readBuffer)
+	assert.NoError(t, err)
+	assert.Equal(t, pli, readBuffer[:n], "the valid packet must still be delivered")
+	_, err = legitStream.Read(readBuffer)
+	assert.ErrorIs(t, err, io.EOF)
+
+	_, err = partialStream.Read(readBuffer)
+	assert.ErrorIs(t, err, io.EOF,
+		"partial destinations of a malformed packet must not receive the packet")
+
+	assert.NoError(t, aSession.Close())
+	assert.NoError(t, bSession.Close())
+}
+
+// TestSessionSRTCPUnknownControlNotDeliveredToMalformedDestination verifies
+// that a packet without a destination of its own is scoped only to destinations
+// of well-formed packets. SSRCs that a malformed packet partially reported
+// before failing must not become delivery targets of trusted control data.
+func TestSessionSRTCPUnknownControlNotDeliveredToMalformedDestination(t *testing.T) {
+	lim := test.TimeOut(time.Second * 5)
+	defer lim.Stop()
+
+	report := test.CheckRoutines(t)
+	defer report()
+
+	// Valid framing, but the CNAME length exceeds the packet. Parsing appends
+	// SSRC 6000 before discovering the malformed item.
+	invalidSDES := []byte{
+		0x81, 0xca, 0x00, 0x02,
+		0x00, 0x00, 0x17, 0x70,
+		0x01, 0xff, 0x00, 0x00,
+	}
+	pli, err := (&rtcp.PictureLossIndication{MediaSSRC: 5000}).Marshal()
+	assert.NoError(t, err)
+	unknown := []byte{0x80, 0xdd, 0x00, 0x01, 0x01, 0x02, 0x03, 0x04}
+
+	aSession, bSession := buildSessionSRTCPPair(t)
+
+	legitStream, err := bSession.OpenReadStream(5000)
+	assert.NoError(t, err)
+	partialStream, err := bSession.OpenReadStream(6000)
+	assert.NoError(t, err)
+
+	compound := append(append(append([]byte{}, pli...), invalidSDES...), unknown...)
+	encrypted, err := aSession.session.localContext.EncryptRTCP(nil, compound, nil)
+	assert.NoError(t, err)
+	assert.Error(t, bSession.decrypt(encrypted, nil))
+
+	assert.NoError(t, legitStream.Close())
+	assert.NoError(t, partialStream.Close())
+
+	readBuffer := make([]byte, 200)
+	for _, expected := range [][]byte{pli, unknown} {
+		n, readErr := legitStream.Read(readBuffer)
+		assert.NoError(t, readErr)
+		assert.Equal(t, expected, readBuffer[:n])
+	}
+	_, err = legitStream.Read(readBuffer)
+	assert.ErrorIs(t, err, io.EOF)
+
+	_, err = partialStream.Read(readBuffer)
+	assert.ErrorIs(t, err, io.EOF,
+		"a partially parsed malformed destination must not receive trusted control data")
+
+	assert.NoError(t, aSession.Close())
+	assert.NoError(t, bSession.Close())
+}
+
+// TestSessionSRTCPDeliveryFailureIsIsolated verifies that a failure to queue a
+// packet to one destination does not starve the other destinations of the same
+// authenticated compound datagram.
+func TestSessionSRTCPDeliveryFailureIsIsolated(t *testing.T) {
+	lim := test.TimeOut(time.Second * 5)
+	defer lim.Stop()
+
+	report := test.CheckRoutines(t)
+	defer report()
+
+	xr := &rtcp.ExtendedReport{SenderSSRC: 1234, Reports: []rtcp.ReportBlock{
+		&rtcp.LossRLEReportBlock{SSRC: 5000, Chunks: []rtcp.Chunk{0x4006, 0x0006}},
+	}}
+	pli := &rtcp.PictureLossIndication{MediaSSRC: 5000}
+	compound, err := rtcp.Marshal([]rtcp.Packet{xr, pli})
+	assert.NoError(t, err)
+
+	aSession, bSession := buildSessionSRTCPPair(t)
+
+	brokenStream, err := bSession.OpenReadStream(1234)
+	assert.NoError(t, err)
+	healthyStream, err := bSession.OpenReadStream(5000)
+	assert.NoError(t, err)
+
+	// Closing the buffer while the stream stays registered makes every write to
+	// 1234 fail without touching the session table.
+	assert.NoError(t, brokenStream.buffer.Close())
+
+	encrypted, err := aSession.session.localContext.EncryptRTCP(nil, compound, nil)
+	assert.NoError(t, err)
+	assert.Error(t, bSession.decrypt(encrypted, nil), "the failed destination must be reported")
+
+	// Both packets addressed to 5000 must still have been queued: the XR
+	// references it via its report block, and the PLI is addressed to it.
+	assert.NoError(t, healthyStream.Close())
+	readBuffer := make([]byte, 200)
+	for _, expected := range []rtcp.Packet{xr, pli} {
+		expectedRaw, marshalErr := expected.Marshal()
+		assert.NoError(t, marshalErr)
+		n, readErr := healthyStream.Read(readBuffer)
+		assert.NoError(t, readErr)
+		assert.Equal(t, expectedRaw, readBuffer[:n])
+	}
+
+	assert.NoError(t, aSession.Close())
+	assert.NoError(t, bSession.Close())
+}
+
+// TestSessionSRTCPFailedDeliveryLeavesNoStream verifies that a stream which
+// cannot accept its first packet does not remain visible in the session. A
+// subsequent datagram for a different SSRC must become the first accepted stream.
+func TestSessionSRTCPFailedDeliveryLeavesNoStream(t *testing.T) {
+	lim := test.TimeOut(time.Second * 5)
+	defer lim.Stop()
+
+	report := test.CheckRoutines(t)
+	defer report()
+
+	const failingSSRC = uint32(5000)
+
+	newConfig := func() *Config {
+		return &Config{
+			Profile: ProtectionProfileAes128CmHmacSha1_80,
+			Keys: SessionKeys{
+				[]byte{0xE1, 0xF9, 0x7A, 0x0D, 0x3E, 0x01, 0x8B, 0xE0, 0xD6, 0x4F, 0xA3, 0x2C, 0x06, 0xDE, 0x41, 0x39},
+				[]byte{0x0E, 0xC6, 0x75, 0xAD, 0x49, 0x8A, 0xFE, 0xEB, 0xB6, 0x96, 0x0B, 0x3A, 0xAB, 0xE6},
+				[]byte{0xE1, 0xF9, 0x7A, 0x0D, 0x3E, 0x01, 0x8B, 0xE0, 0xD6, 0x4F, 0xA3, 0x2C, 0x06, 0xDE, 0x41, 0x39},
+				[]byte{0x0E, 0xC6, 0x75, 0xAD, 0x49, 0x8A, 0xFE, 0xEB, 0xB6, 0x96, 0x0B, 0x3A, 0xAB, 0xE6},
+			},
+			// A stream for failingSSRC gets a buffer that is already closed, so
+			// its first write fails while any other SSRC works normally.
+			BufferFactory: func(_ packetio.BufferPacketType, ssrc uint32) io.ReadWriteCloser {
+				buff := &packetBuffer{Buffer: packetio.NewBuffer()}
+				if ssrc == failingSSRC {
+					_ = buff.Close()
+				}
+
+				return buff
+			},
+		}
+	}
+
+	aPipe, bPipe := net.Pipe()
+	config := newConfig()
+	aSession, err := NewSessionSRTCP(aPipe, config)
+	assert.NoError(t, err)
+	bSession, err := NewSessionSRTCP(bPipe, config)
+	assert.NoError(t, err)
+
+	failing, err := encryptSRTCP(aSession.session.localContext,
+		&rtcp.PictureLossIndication{MediaSSRC: failingSSRC})
+	assert.NoError(t, err)
+	assert.Error(t, bSession.decrypt(failing, nil),
+		"delivery to a closed stream must be reported")
+
+	bSession.session.readStreamsLock.Lock()
+	_, hasFailing := bSession.session.readStreams[failingSSRC]
+	streamCount := len(bSession.session.readStreams)
+	bSession.session.readStreamsLock.Unlock()
+	assert.False(t, hasFailing, "a stream that accepted no packet must not stay registered")
+	assert.Zero(t, streamCount)
+
+	// A valid datagram for another SSRC still yields the first accepted stream.
+	good, err := encryptSRTCP(aSession.session.localContext,
+		&rtcp.PictureLossIndication{MediaSSRC: 6000})
+	assert.NoError(t, err)
+
+	accepted := make(chan uint32, 1)
+	go func() {
+		_, ssrc, acceptErr := bSession.AcceptStream()
+		if acceptErr != nil {
+			accepted <- 0
+
+			return
+		}
+		accepted <- ssrc
+	}()
+	assert.NoError(t, bSession.decrypt(good, nil))
+	assert.Equal(t, uint32(6000), <-accepted,
+		"the next authenticated datagram must establish its stream")
+
+	bSession.session.readStreamsLock.Lock()
+	_, hasGood := bSession.session.readStreams[6000]
+	_, stillHasFailing := bSession.session.readStreams[failingSSRC]
+	bSession.session.readStreamsLock.Unlock()
+	assert.True(t, hasGood, "the next authenticated datagram must establish its stream")
+	assert.False(t, stillHasFailing, "the discarded stream must not come back")
+
+	assert.NoError(t, aSession.Close())
+	assert.NoError(t, bSession.Close())
+}
+
+func encryptedPayloadLength(t *testing.T, encrypted []byte) int {
+	t.Helper()
+
+	authTagLen, err := ProtectionProfileAes128CmHmacSha1_80.AuthTagRTCPLen()
+	assert.NoError(t, err)
+
+	return len(encrypted) - authTagLen - srtcpIndexSize
 }
 
 func encryptSRTCP(context *Context, pkt rtcp.Packet) ([]byte, error) {

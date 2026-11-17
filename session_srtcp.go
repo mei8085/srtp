@@ -191,11 +191,143 @@ func appendDestinationSSRCs(dst []uint32, pkts []rtcp.RawPacket) []uint32 {
 	return dst
 }
 
+// joinErr appends err to errs, ignoring nil. The identity of a lone error is
+// preserved so callers can still match a concrete failure value.
+func joinErr(errs, err error) error {
+	if err == nil {
+		return errs
+	}
+	if errs == nil {
+		return err
+	}
+
+	return errors.Join(errs, err)
+}
+
+// packetDestinations returns the SSRCs pkt has to be delivered to.
+//
+// Packets that cannot report their destination are abnormal control messages:
+// the parser may have appended partial SSRCs before failing, so the returned
+// destinations are discarded and the packet is not forwarded anywhere. Packets
+// that legitimately carry no destination of their own (like unknown RTCP types
+// parsed as rtcp.RawPacket) are scoped to the streams the compound packet is
+// addressed to; they never get a stream of their own.
+func (s *SessionSRTCP) packetDestinations(
+	pkt rtcp.RawPacket,
+	pkts []rtcp.RawPacket,
+	compoundSSRCsComputed *bool,
+) ([]uint32, error) {
+	var err error
+	s.destinationSSRCs, err = pkt.ParseDestinationSSRC(s.destinationSSRCs[:0])
+	if err != nil {
+		return nil, err
+	}
+
+	destinations := dedupeSSRCs(s.destinationSSRCs)
+	if len(destinations) != 0 {
+		return destinations, nil
+	}
+
+	if !*compoundSSRCsComputed {
+		s.compoundSSRCs = appendDestinationSSRCs(s.compoundSSRCs[:0], pkts)
+		*compoundSSRCsComputed = true
+	}
+
+	return s.compoundSSRCs, nil
+}
+
+// discardStream removes a read stream that was created for this datagram but
+// never accepted a packet. Closing the buffer as well releases any reader that
+// raced with OpenReadStream for the same SSRC instead of leaving it blocked on a
+// stream that carried no trusted data.
+func (s *SessionSRTCP) discardStream(ssrc uint32, readStream *ReadStreamSRTCP) {
+	if err := readStream.Close(); err != nil {
+		// The stream is already gone (closed concurrently) or was not inited;
+		// either way no session entry is left behind for this SSRC.
+		s.session.removeReadStream(ssrc)
+	}
+}
+
+// deliverToStream queues an authenticated packet to the read stream of ssrc.
+//
+// A stream is published to AcceptStream only once it has accepted its first
+// authenticated packet: a stream that could not be written is discarded again, so
+// neither AcceptStream nor a later read can observe session state that never
+// carried trusted data. The returned sessionClosed flag reports that the session
+// is shutting down and delivery must stop.
+func (s *SessionSRTCP) deliverToStream(
+	ssrc uint32,
+	pkt []byte,
+	attrs packetio.Attributes,
+) (sessionClosed bool, err error) {
+	r, isNew := s.session.getOrCreateReadStream(ssrc, s, newReadStreamSRTCP)
+	if r == nil {
+		return true, nil // Session has been closed
+	}
+
+	readStream, ok := r.(*ReadStreamSRTCP)
+	if !ok {
+		if isNew {
+			s.session.removeReadStream(ssrc)
+		}
+
+		return false, errFailedTypeAssertion
+	}
+
+	if _, writeErr := readStream.write(pkt, attrs); writeErr != nil {
+		if isNew {
+			s.discardStream(ssrc, readStream)
+		}
+
+		return false, writeErr
+	}
+
+	if isNew {
+		if !s.session.acceptStreamTimeout.IsZero() {
+			_ = s.session.nextConn.SetReadDeadline(time.Time{})
+		}
+		s.session.newStream <- readStream // Notify AcceptStream
+	}
+
+	return false, nil
+}
+
+// deliver forwards every packet of an authenticated compound datagram to the
+// streams it is addressed to. A failure for one destination is reported but does
+// not stop delivery to the remaining destinations, so a rejected stream cannot
+// starve a legitimate control message in the same compound.
+func (s *SessionSRTCP) deliver(pkts []rtcp.RawPacket, attrs packetio.Attributes) error {
+	compoundSSRCsComputed := false
+	var errs error
+	for _, pkt := range pkts {
+		destinations, destErr := s.packetDestinations(pkt, pkts, &compoundSSRCsComputed)
+		if destErr != nil {
+			errs = joinErr(errs, destErr)
+
+			continue
+		}
+
+		for _, ssrc := range destinations {
+			sessionClosed, deliverErr := s.deliverToStream(ssrc, pkt, attrs)
+			if sessionClosed {
+				return nil // Session has been closed
+			}
+			errs = joinErr(errs, deliverErr)
+		}
+	}
+
+	return errs
+}
+
 // decrypt is called synchronously by the session's read loop and must not
 // be called concurrently. It reuses scratch buffers that are not protected
 // by a mutex.
 //
-//nolint:cyclop
+// The authentication boundary comes first: a datagram that does not verify is
+// rejected as a whole, before any SSRC in it can create a read stream, advance
+// per-SSRC replay state, or trigger an AcceptStream notification. Only once the
+// compound datagram has been authenticated and split into packets is anything
+// routed; see deliver for the per-packet rules.
 func (s *SessionSRTCP) decrypt(buf []byte, attrs packetio.Attributes) error {
 	s.session.remoteContextMutex.Lock()
 	decrypted, err := s.remoteContext.DecryptRTCP(buf, buf, nil)
@@ -206,58 +338,12 @@ func (s *SessionSRTCP) decrypt(buf []byte, attrs packetio.Attributes) error {
 
 	s.rawPackets, err = rtcp.AppendRawPackets(s.rawPackets[:0], decrypted)
 	if err != nil {
+		// The compound framing is broken, so no packet in it can be attributed
+		// to a stream with confidence.
 		return err
 	}
-	pkts := s.rawPackets
 
-	compoundSSRCsComputed := false
-	var parseErrs error
-	for _, pkt := range pkts {
-		s.destinationSSRCs, err = pkt.ParseDestinationSSRC(s.destinationSSRCs[:0])
-		if err != nil {
-			// Skip packets whose destination SSRCs could not be parsed so
-			// the remaining packets in the compound are still forwarded.
-			parseErrs = errors.Join(parseErrs, err)
-
-			continue
-		}
-
-		destinations := dedupeSSRCs(s.destinationSSRCs)
-		if len(destinations) == 0 {
-			// Packets without a destination of their own (e.g. unknown packet
-			// types parsed as rtcp.RawPacket) are delivered to every stream the
-			// compound packet is addressed to instead of being dropped.
-			if !compoundSSRCsComputed {
-				s.compoundSSRCs = appendDestinationSSRCs(s.compoundSSRCs[:0], pkts)
-				compoundSSRCsComputed = true
-			}
-			destinations = s.compoundSSRCs
-		}
-
-		for _, ssrc := range destinations {
-			r, isNew := s.session.getOrCreateReadStream(ssrc, s, newReadStreamSRTCP)
-			if r == nil {
-				return nil // Session has been closed
-			} else if isNew {
-				if !s.session.acceptStreamTimeout.IsZero() {
-					_ = s.session.nextConn.SetReadDeadline(time.Time{})
-				}
-				s.session.newStream <- r // Notify AcceptStream
-			}
-
-			readStream, ok := r.(*ReadStreamSRTCP)
-			if !ok {
-				return errFailedTypeAssertion
-			}
-
-			_, err = readStream.write(pkt, attrs)
-			if err != nil {
-				return err
-			}
-		}
-	}
-
-	return parseErrs
+	return s.deliver(s.rawPackets, attrs)
 }
 
 // UpdateKey resets packet state with fresh keys.
