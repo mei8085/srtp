@@ -240,3 +240,35 @@ func Cryptex(cryptexMode CryptexMode) ContextOption {
 		return nil
 	}
 }
+
+// SRTPSSRCStateLimit sets the maximum number of per-SSRC states the Context keeps
+// for decrypting SRTP packets. A new SSRC only occupies a state after a packet for
+// it has been successfully authenticated; once the limit is reached, packets for
+// unknown SSRCs are rejected with ErrTooManySSRCStates, while packets for already
+// established SSRCs are still accepted. The limit does not block states created for
+// encryption or via SetROC. Zero (the default) means no limit.
+//
+// Note that states are never evicted: a long-lived Context that expects SSRC churn
+// should either set the limit generously or reset state with fresh keys.
+//
+// This option may be updated after construction with Context.UpdateOptions.
+func SRTPSSRCStateLimit(limit uint32) ContextOption { // nolint:revive
+	return func(c *Context) error {
+		c.srtpSSRCStateLimit = limit
+
+		return nil
+	}
+}
+
+// SRTCPSSRCStateLimit sets the maximum number of per-SSRC states the Context keeps
+// for decrypting SRTCP packets. It behaves like SRTPSSRCStateLimit, applied to the
+// SRTCP state table.
+//
+// This option may be updated after construction with Context.UpdateOptions.
+func SRTCPSSRCStateLimit(limit uint32) ContextOption {
+	return func(c *Context) error {
+		c.srtcpSSRCStateLimit = limit
+
+		return nil
+	}
+}

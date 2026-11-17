@@ -216,3 +216,16 @@ func TestInvalidContextOptions(t *testing.T) {
 		})
 	}
 }
+
+func TestContextWithKeyPreservesSSRCStateLimits(t *testing.T) {
+	c, err := CreateContext(make([]byte, 16), make([]byte, 14), profileCTR,
+		SRTPSSRCStateLimit(3), SRTCPSSRCStateLimit(4))
+	assert.NoError(t, err)
+
+	// Key rotation (e.g. Session.UpdateKey) rebuilds the Context via contextWithKey;
+	// the SSRC state limits must survive the switch so the receive policy stays consistent.
+	next, err := c.contextWithKey(make([]byte, 16), make([]byte, 14), profileCTR)
+	assert.NoError(t, err)
+	assert.Equal(t, uint32(3), next.srtpSSRCStateLimit)
+	assert.Equal(t, uint32(4), next.srtcpSSRCStateLimit)
+}

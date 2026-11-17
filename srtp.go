@@ -46,6 +46,12 @@ func (c *Context) decryptRTP(dst, ciphertext []byte, header *rtp.Header, headerL
 	// no new map entry is inserted until after the auth tag has been verified. The state
 	// is committed to the map by setSRTPSSRCState only after Accept() succeeds below.
 	ssrcState, existingState := c.getSRTPSSRCState(header.SSRC, false)
+	if !existingState && c.srtpSSRCStateLimitReached() {
+		// Reject before any per-packet cryptographic work: once the state table is
+		// full, an unauthenticated packet for a new SSRC can never be committed, so
+		// failing fast here keeps flooded packets from consuming CPU as well.
+		return nil, fmt.Errorf("%w: ssrc=%d", ErrTooManySSRCStates, header.SSRC)
+	}
 
 	var roc uint32
 	var diff int64

@@ -97,6 +97,14 @@ type Context struct {
 	srtpSSRCStates  map[uint32]*srtpSSRCState
 	srtcpSSRCStates map[uint32]*srtcpSSRCState
 
+	// srtpSSRCStateLimit and srtcpSSRCStateLimit bound the number of per-SSRC
+	// states kept for decrypting packets. 0 (the default) means no limit.
+	// The limits are only enforced when a received packet would commit a new
+	// state after successful authentication; states created for encryption or
+	// via SetROC/SetIndex are not blocked.
+	srtpSSRCStateLimit  uint32
+	srtcpSSRCStateLimit uint32
+
 	newSRTCPReplayDetector func() replaydetector.ReplayDetector
 	newSRTPReplayDetector  func() replaydetector.ReplayDetector
 
@@ -191,6 +199,8 @@ func (c *Context) contextWithKey(masterKey, masterSalt []byte, profile Protectio
 		next.rocTransmitRate = c.rocTransmitRate
 		next.authTagRTPLen = c.authTagRTPLen
 		next.cryptexMode = c.cryptexMode
+		next.srtpSSRCStateLimit = c.srtpSSRCStateLimit
+		next.srtcpSSRCStateLimit = c.srtcpSSRCStateLimit
 
 		return nil
 	})
@@ -381,6 +391,18 @@ func (c *Context) setSRTPSSRCState(state *srtpSSRCState) {
 
 func (c *Context) setSRTCPSSRCState(state *srtcpSSRCState) {
 	c.srtcpSSRCStates[state.ssrc] = state
+}
+
+// srtpSSRCStateLimitReached reports whether committing a new SRTP SSRC state
+// would exceed the configured limit. Existing states are never affected.
+func (c *Context) srtpSSRCStateLimitReached() bool {
+	return c.srtpSSRCStateLimit > 0 && uint32(len(c.srtpSSRCStates)) >= c.srtpSSRCStateLimit //nolint:gosec // G115
+}
+
+// srtcpSSRCStateLimitReached reports whether committing a new SRTCP SSRC state
+// would exceed the configured limit. Existing states are never affected.
+func (c *Context) srtcpSSRCStateLimitReached() bool {
+	return c.srtcpSSRCStateLimit > 0 && uint32(len(c.srtcpSSRCStates)) >= c.srtcpSSRCStateLimit //nolint:gosec // G115
 }
 
 // ROC returns SRTP rollover counter value of specified SSRC.

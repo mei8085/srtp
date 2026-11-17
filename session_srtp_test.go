@@ -1202,3 +1202,65 @@ func keyTestKeys(t *testing.T, profile ProtectionProfile) SessionKeys {
 		RemoteMasterSalt: bytes.Repeat([]byte{2}, saltLen),
 	}
 }
+
+func TestSessionSRTPSSRCStateLimit(t *testing.T) {
+	lim := test.TimeOut(time.Second * 5)
+	defer lim.Stop()
+
+	report := test.CheckRoutines(t)
+	defer report()
+
+	const (
+		ssrcA = uint32(0xAAAA0001)
+		ssrcB = uint32(0xBBBB0002)
+	)
+
+	aSession, bPipe, config := buildSessionSRTP(t)
+	config.RemoteOptions = append(config.RemoteOptions, SRTPSSRCStateLimit(1))
+	bSession, err := NewSessionSRTP(bPipe, config)
+	assert.NoError(t, err)
+
+	writePacket := func(ssrc uint32, sequenceNumber uint16) {
+		t.Helper()
+
+		pkt := &rtp.Packet{
+			Payload: []byte{0x00, 0x01, 0x02, 0x03},
+			Header:  rtp.Header{SSRC: ssrc, SequenceNumber: sequenceNumber},
+		}
+		encrypted, encryptErr := encryptSRTP(aSession.session.localContext, pkt)
+		assert.NoError(t, encryptErr)
+
+		_, writeErr := aSession.session.nextConn.Write(encrypted)
+		assert.NoError(t, writeErr)
+	}
+
+	// The first stream is established and notified normally.
+	writePacket(ssrcA, 1)
+	readStream, acceptedSSRC, err := bSession.AcceptStream()
+	assert.NoError(t, err)
+	assert.Equal(t, ssrcA, acceptedSSRC)
+
+	// A packet for a second SSRC exceeds the receive state limit: it must be
+	// dropped without creating a stream or consuming a newStream notification.
+	writePacket(ssrcB, 1)
+
+	// Synchronize with the session read loop through the established stream: once
+	// this packet is delivered, the over-limit packet has been processed.
+	writePacket(ssrcA, 2)
+	readBuffer := make([]byte, 16)
+	_, err = readStream.Read(readBuffer)
+	assert.NoError(t, err)
+
+	bSession.session.readStreamsLock.Lock()
+	streamCount := len(bSession.session.readStreams)
+	bSession.session.readStreamsLock.Unlock()
+	assert.Equal(t, 1, streamCount, "over-limit SSRC must not create a read stream")
+
+	bSession.session.remoteContextMutex.Lock()
+	stateCount := len(bSession.session.remoteContext.srtpSSRCStates)
+	bSession.session.remoteContextMutex.Unlock()
+	assert.Equal(t, 1, stateCount, "over-limit SSRC must not occupy receive state")
+
+	assert.NoError(t, aSession.Close())
+	assert.NoError(t, bSession.Close())
+}

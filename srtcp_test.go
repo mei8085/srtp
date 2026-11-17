@@ -757,3 +757,61 @@ func TestSRTCPFailedAuthDoesNotGrowSSRCMap(t *testing.T) {
 	t.Run("CTR", func(t *testing.T) { testSRTCPFailedAuthDoesNotGrowSSRCMap(t, profileCTR) })
 	t.Run("GCM", func(t *testing.T) { testSRTCPFailedAuthDoesNotGrowSSRCMap(t, profileGCM) })
 }
+
+func TestSRTCPSSRCStateLimit(t *testing.T) {
+	encryptCtx, err := buildTestContext(profileCTR)
+	assert.NoError(t, err)
+
+	decryptCtx, err := buildTestContext(profileCTR, SRTCPSSRCStateLimit(1))
+	assert.NoError(t, err)
+
+	encryptPacket := func(ssrc uint32) []byte {
+		t.Helper()
+
+		pkt := &rtcp.ReceiverReport{SSRC: ssrc}
+		pktRaw, marshalErr := pkt.Marshal()
+		assert.NoError(t, marshalErr)
+
+		encrypted, encryptErr := encryptCtx.EncryptRTCP(nil, pktRaw, nil)
+		assert.NoError(t, encryptErr)
+
+		return encrypted
+	}
+
+	// Packets that fail authentication must not consume state slots: flood the
+	// context with tampered packets, each carrying a fresh unauthenticated SSRC.
+	for i := range 10 {
+		tampered := encryptPacket(uint32(0xBAD000 + i)) //nolint:gosec // G115
+		tampered[len(tampered)-1] ^= 0xFF               // corrupt the auth tag
+
+		_, err = decryptCtx.DecryptRTCP(nil, tampered, nil)
+		assert.Error(t, err)
+	}
+	assert.Empty(t, decryptCtx.srtcpSSRCStates,
+		"failed authentication must not consume SSRC state slots")
+
+	// The first valid stream is established and occupies the only slot.
+	const ssrcA = 0xAAAA0001
+	_, err = decryptCtx.DecryptRTCP(nil, encryptPacket(ssrcA), nil)
+	assert.NoError(t, err)
+	assert.Len(t, decryptCtx.srtcpSSRCStates, 1)
+
+	// A second SSRC exceeds the limit and is rejected without leaving state behind.
+	const ssrcB = 0xBBBB0002
+	_, err = decryptCtx.DecryptRTCP(nil, encryptPacket(ssrcB), nil)
+	assert.ErrorIs(t, err, ErrTooManySSRCStates)
+	assert.Len(t, decryptCtx.srtcpSSRCStates, 1,
+		"rejected SSRC must not leave a reusable state entry")
+	_, ok := decryptCtx.Index(ssrcB)
+	assert.False(t, ok, "rejected SSRC must not become visible")
+
+	// The established stream is unaffected by the limit.
+	_, err = decryptCtx.DecryptRTCP(nil, encryptPacket(ssrcA), nil)
+	assert.NoError(t, err, "established streams must keep working once the limit is reached")
+
+	// Raising the limit at runtime admits the previously rejected SSRC.
+	assert.NoError(t, decryptCtx.UpdateOptions(SRTCPSSRCStateLimit(2)))
+	_, err = decryptCtx.DecryptRTCP(nil, encryptPacket(ssrcB), nil)
+	assert.NoError(t, err)
+	assert.Len(t, decryptCtx.srtcpSSRCStates, 2)
+}

@@ -54,6 +54,12 @@ func (c *Context) decryptRTCP(dst, encrypted []byte) ([]byte, error) {
 	// inserted until after the auth tag has been verified. The state is committed
 	// to the map by setSRTCPSSRCState only after Accept() succeeds below.
 	ssrcState, existingState := c.getSRTCPSSRCState(ssrc, false)
+	if !existingState && c.srtcpSSRCStateLimitReached() {
+		// Reject before any per-packet cryptographic work: once the state table is
+		// full, an unauthenticated packet for a new SSRC can never be committed, so
+		// failing fast here keeps flooded packets from consuming CPU as well.
+		return nil, fmt.Errorf("%w: ssrc=%d", ErrTooManySSRCStates, ssrc)
+	}
 
 	// The replay check is intentionally performed before authentication.
 	// Rejecting already-seen sequence numbers here avoids the CPU cost of

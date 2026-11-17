@@ -15,6 +15,11 @@ var (
 	ErrMKINotFound = errors.New("MKI not found")
 	// ErrContextOptionNotUpdatable indicates an option cannot be updated after construction.
 	ErrContextOptionNotUpdatable = errors.New("option can only be set during context construction")
+	// ErrTooManySSRCStates is returned when a received packet would create a new per-SSRC
+	// decrypt state, but the configured SSRC state limit (see SRTPSSRCStateLimit and
+	// SRTCPSSRCStateLimit) has already been reached. Packets for already established
+	// SSRCs are never rejected for this reason.
+	ErrTooManySSRCStates = errors.New("exceeded the maximum number of SSRC states")
 
 	errDuplicated                    = errors.New("duplicated packet")
 	errShortSrtpMasterKey            = errors.New("SRTP master key is not long enough")
