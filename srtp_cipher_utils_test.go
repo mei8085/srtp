@@ -36,22 +36,30 @@ func newSrtpCipherAesCmHmacSha1WithDerivedKeys(
 		protectionProfileWithArgs: protectionProfileWithArgs{ProtectionProfile: profile},
 		srtpEncrypted:             encryptSRTP,
 		srtcpEncrypted:            encryptSRTCP,
+		srtpDerivedKeys:           map[uint64]*srtpAesCmHmacSha1Keys{},
+		srtcpDerivedKeys:          map[uint64]*srtpAesCmHmacSha1Keys{},
+	}
+
+	derivedKeys := &srtpAesCmHmacSha1Keys{
+		srtpSessionSalt:  keys.srtpSessionSalt,
+		srtpSessionAuth:  hmac.New(sha1.New, keys.srtpSessionAuthTag),
+		srtcpSessionSalt: keys.srtcpSessionSalt,
+		srtcpSessionAuth: hmac.New(sha1.New, keys.srtcpSessionAuthTag),
 	}
 
 	var err error
-	if srtpCipher.srtpBlock, err = aes.NewCipher(keys.srtpSessionKey); err != nil {
+	if derivedKeys.srtpBlock, err = aes.NewCipher(keys.srtpSessionKey); err != nil {
 		return nil, err
 	}
 
-	if srtpCipher.srtcpBlock, err = aes.NewCipher(keys.srtcpSessionKey); err != nil {
+	if derivedKeys.srtcpBlock, err = aes.NewCipher(keys.srtcpSessionKey); err != nil {
 		return nil, err
 	}
 
-	srtpCipher.srtpSessionSalt = keys.srtpSessionSalt
-	srtpCipher.srtcpSessionSalt = keys.srtcpSessionSalt
-
-	srtpCipher.srtcpSessionAuth = hmac.New(sha1.New, keys.srtcpSessionAuthTag)
-	srtpCipher.srtpSessionAuth = hmac.New(sha1.New, keys.srtpSessionAuthTag)
+	// Test-vector ciphers carry no master key material, so only the initial
+	// (r == 0) key set exists; this mirrors a zero key derivation rate.
+	srtpCipher.srtpDerivedKeys[0] = derivedKeys
+	srtpCipher.srtcpDerivedKeys[0] = derivedKeys
 
 	return srtpCipher, nil
 }
@@ -65,6 +73,8 @@ func newSrtpCipherAeadAesGcmWithDerivedKeys(
 		protectionProfileWithArgs: protectionProfileWithArgs{ProtectionProfile: profile},
 		srtpEncrypted:             encryptSRTP,
 		srtcpEncrypted:            encryptSRTCP,
+		srtpDerivedKeys:           map[uint64]*srtpAeadAesGcmKeys{},
+		srtcpDerivedKeys:          map[uint64]*srtpAeadAesGcmKeys{},
 	}
 
 	srtpBlock, err := aes.NewCipher(keys.srtpSessionKey)
@@ -72,7 +82,7 @@ func newSrtpCipherAeadAesGcmWithDerivedKeys(
 		return nil, err
 	}
 
-	srtpCipher.srtpCipher, err = cipher.NewGCM(srtpBlock)
+	srtpAEAD, err := cipher.NewGCM(srtpBlock)
 	if err != nil {
 		return nil, err
 	}
@@ -82,13 +92,22 @@ func newSrtpCipherAeadAesGcmWithDerivedKeys(
 		return nil, err
 	}
 
-	srtpCipher.srtcpCipher, err = cipher.NewGCM(srtcpBlock)
+	srtcpAEAD, err := cipher.NewGCM(srtcpBlock)
 	if err != nil {
 		return nil, err
 	}
 
-	srtpCipher.srtpSessionSalt = keys.srtpSessionSalt
-	srtpCipher.srtcpSessionSalt = keys.srtcpSessionSalt
+	derivedKeys := &srtpAeadAesGcmKeys{
+		srtpCipher:       srtpAEAD,
+		srtcpCipher:      srtcpAEAD,
+		srtpSessionSalt:  keys.srtpSessionSalt,
+		srtcpSessionSalt: keys.srtcpSessionSalt,
+	}
+
+	// Test-vector ciphers carry no master key material, so only the initial
+	// (r == 0) key set exists; this mirrors a zero key derivation rate.
+	srtpCipher.srtpDerivedKeys[0] = derivedKeys
+	srtpCipher.srtcpDerivedKeys[0] = derivedKeys
 
 	return srtpCipher, nil
 }

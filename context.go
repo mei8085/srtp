@@ -113,6 +113,14 @@ type Context struct {
 	rccMode         RCCMode
 	rocTransmitRate uint16
 
+	// keyDerivationRate is the SRTP/SRTCP key derivation rate (kdr) from
+	// RFC 3711 section 4.3. A zero value disables periodic re-keying: the
+	// session keys derived initially are used for the whole lifetime of the
+	// master key. A non-zero value makes the session keys refresh every
+	// keyDerivationRate packets, independently for RTP and RTCP. The value
+	// MUST remain fixed for the lifetime of the associated master key.
+	keyDerivationRate uint64
+
 	authTagRTPLen *int
 
 	cryptexMode CryptexMode
@@ -189,6 +197,7 @@ func (c *Context) contextWithKey(masterKey, masterSalt []byte, profile Protectio
 		next.encryptSRTCP = c.encryptSRTCP
 		next.rccMode = c.rccMode
 		next.rocTransmitRate = c.rocTransmitRate
+		next.keyDerivationRate = c.keyDerivationRate
 		next.authTagRTPLen = c.authTagRTPLen
 		next.cryptexMode = c.cryptexMode
 

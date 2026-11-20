@@ -4,9 +4,11 @@
 package srtp
 
 import (
+	"crypto/aes"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestValidSessionKeys_AesCm128(t *testing.T) {
@@ -77,11 +79,67 @@ func TestValidSessionKeys_AesCm256(t *testing.T) {
 		"Session Auth Tag % 02x does not match expected % 02x", sessionAuthTag, expectedSessionAuthTag)
 }
 
-// This test asserts that calling aesCmKeyDerivation with a non-zero indexOverKdr fails
-// Currently this isn't supported, but the API makes sure we can add this in the future.
+// TestIndexOverKDR checks that r = index DIV kdr is XORed into the key
+// derivation input block exactly as specified by RFC 3711 section 4.3.1 and
+// Appendix B.3: the six-octet big-endian r occupies octets 8..13, after the
+// label in octet 7.
 func TestIndexOverKDR(t *testing.T) {
-	_, err := aesCmKeyDerivation(labelSRTPAuthenticationTag, []byte{}, []byte{}, 1, 0)
-	assert.Error(t, err)
+	masterKey := []byte{0xE1, 0xF9, 0x7A, 0x0D, 0x3E, 0x01, 0x8B, 0xE0, 0xD6, 0x4F, 0xA3, 0x2C, 0x06, 0xDE, 0x41, 0x39}
+	masterSalt := []byte{0x0E, 0xC6, 0x75, 0xAD, 0x49, 0x8A, 0xFE, 0xEB, 0xB6, 0x96, 0x0B, 0x3A, 0xAB, 0xE6}
+
+	// r == 0 must keep producing the RFC 3711 Appendix B.3 initial cipher key.
+	initialKey, err := aesCmKeyDerivation(labelSRTPEncryption, masterKey, masterSalt, 0, len(masterKey))
+	assert.NoError(t, err)
+	assert.Equal(t, []byte{
+		0xC6, 0x1E, 0x7A, 0x93, 0x74, 0x4F, 0x39, 0xEE, 0x10, 0x73, 0x4A, 0xFE, 0x3F, 0xF7, 0xA0, 0x87,
+	}, initialKey)
+
+	// A non-zero r changes the PRF input and therefore the derived key.
+	derivedAtOne, err := aesCmKeyDerivation(labelSRTPEncryption, masterKey, masterSalt, 1, len(masterKey))
+	assert.NoError(t, err)
+	assert.NotEqual(t, initialKey, derivedAtOne)
+
+	// The largest encodable r (2^48 - 1) only touches octets 8..13 and must be
+	// accepted without truncation.
+	maxR := maxKeyDerivationRateIndex
+	derivedAtMax, err := aesCmKeyDerivation(labelSRTPEncryption, masterKey, masterSalt, maxR, len(masterKey))
+	assert.NoError(t, err)
+	assert.NotEqual(t, initialKey, derivedAtMax)
+
+	// Distinct labels keep producing distinct keys for the same r.
+	saltAtOne, err := aesCmKeyDerivation(labelSRTPSalt, masterKey, masterSalt, 1, len(masterSalt))
+	assert.NoError(t, err)
+	assert.NotEqual(t, derivedAtOne, saltAtOne)
+}
+
+// TestAesCmKeyDerivationInputBlock verifies the PRF input block layout by
+// deriving against a zero master salt: the output then equals the AES
+// encryption of the raw key_id || counter block, so the label and r
+// positions can be asserted byte for byte.
+func TestAesCmKeyDerivationInputBlock(t *testing.T) {
+	masterKey := make([]byte, 16)
+	masterSalt := make([]byte, 14)
+
+	block, err := aes.NewCipher(masterKey)
+	require.NoError(t, err)
+
+	const r = uint64(0x010203040506)
+	out, err := aesCmKeyDerivation(labelSRTCPEncryption, masterKey, masterSalt, r, 16)
+	require.NoError(t, err)
+
+	var expectedInput [16]byte
+	expectedInput[7] = labelSRTCPEncryption
+	expectedInput[8] = 0x01
+	expectedInput[9] = 0x02
+	expectedInput[10] = 0x03
+	expectedInput[11] = 0x04
+	expectedInput[12] = 0x05
+	expectedInput[13] = 0x06
+	// octets 14..15 stay zero for the first AES-CM counter block.
+
+	var expectedOut [16]byte
+	block.Encrypt(expectedOut[:], expectedInput[:])
+	assert.Equal(t, expectedOut[:], out)
 }
 
 func BenchmarkGenerateCounter(b *testing.B) {

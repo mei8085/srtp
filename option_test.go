@@ -166,6 +166,14 @@ func TestContextOptions(t *testing.T) {
 				assert.Equal(t, 8, *c.authTagRTPLen)
 			},
 		},
+		{
+			name:   "KeyDerivationRate",
+			option: func() ContextOption { return KeyDerivationRate(1024) },
+			validate: func(t *testing.T, c *Context) {
+				t.Helper()
+				assert.Equal(t, uint64(1024), c.keyDerivationRate)
+			},
+		},
 	}
 
 	for _, tt := range tests {

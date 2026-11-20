@@ -17,11 +17,15 @@ type srtpCipher interface {
 	AEADAuthTagLen() (int, error)
 	getRTCPIndex([]byte) uint32
 
-	encryptRTP([]byte, *rtp.Header, int, []byte, uint32, bool) ([]byte, error)
-	encryptRTCP([]byte, []byte, uint32, uint32) ([]byte, error)
+	// indexOverKdr is r = packet index DIV key derivation rate (RFC 3711
+	// section 4.3). It selects the session key set the packet is protected
+	// with. A zero key derivation rate always passes zero here, preserving the
+	// single-key behavior.
+	encryptRTP([]byte, *rtp.Header, int, []byte, uint32, uint64, bool) ([]byte, error)
+	encryptRTCP([]byte, []byte, uint32, uint32, uint64) ([]byte, error)
 
-	decryptRTP([]byte, []byte, *rtp.Header, int, uint32, bool) ([]byte, error)
-	decryptRTCP([]byte, []byte, uint32, uint32) ([]byte, error)
+	decryptRTP([]byte, []byte, *rtp.Header, int, uint32, uint64, bool) ([]byte, error)
+	decryptRTCP([]byte, []byte, uint32, uint32, uint64) ([]byte, error)
 	setCryptex(bool)
 }
 

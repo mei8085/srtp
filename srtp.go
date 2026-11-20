@@ -82,6 +82,16 @@ func (c *Context) decryptRTP(dst, ciphertext []byte, header *rtp.Header, headerL
 		}
 	}
 
+	// Select the session keys for this packet with r = index DIV kdr. The same
+	// formula is used by the sending side (encryptRTP), so both peers derive
+	// identical keys for identical indices, including for out-of-order packets
+	// and packets re-entering the replay window. Reject the packet instead of
+	// deriving an unusable key when r cannot be encoded in the 48-bit field.
+	indexOverKdr, err := c.keyDerivationIndex(index)
+	if err != nil {
+		return nil, err
+	}
+
 	err = c.checkCryptex(header)
 	if err != nil {
 		return nil, err
@@ -99,7 +109,7 @@ func (c *Context) decryptRTP(dst, ciphertext []byte, header *rtp.Header, headerL
 
 	dst = growBufferSize(dst, len(ciphertext)-authTagLen-mkiLen)
 
-	dst, err = cipher.decryptRTP(dst, ciphertext, header, headerLen, roc, hasRocInPacket)
+	dst, err = cipher.decryptRTP(dst, ciphertext, header, headerLen, roc, indexOverKdr, hasRocInPacket)
 	if err != nil {
 		return nil, err
 	}
@@ -173,9 +183,43 @@ func (c *Context) encryptRTP(dst []byte, header *rtp.Header, headerLen int, plai
 	}
 	ssrcState.updateRolloverCount(header.SequenceNumber, diff, false, 0)
 
+	// Compute r = index DIV kdr from the 48-bit SRTP packet index before the
+	// packet is protected. With a zero key derivation rate the DIV-0 convention
+	// (RFC 3711 section 4.3.1) yields r == 0, which keeps the single initial
+	// key set in use for every packet.
+	index := (uint64(roc) << 16) | uint64(header.SequenceNumber)
+	indexOverKdr, err := c.keyDerivationIndex(index)
+	if err != nil {
+		return nil, err
+	}
+
 	rocInPacket := c.rccMode != RCCModeNone && header.SequenceNumber%c.rocTransmitRate == 0
 
-	return c.cipher.encryptRTP(dst, header, headerLen, plaintext, roc, rocInPacket)
+	return c.cipher.encryptRTP(dst, header, headerLen, plaintext, roc, indexOverKdr, rocInPacket)
+}
+
+// keyDerivationIndex returns r = packet index DIV key derivation rate for the
+// given SRTP/SRTCP packet index, implementing the boundary rules of RFC 3711
+// section 4.3.1.
+//
+// The same function is used for both sending and receiving, and for both RTP
+// and RTCP (each direction supplies its own packet index), so every peer
+// derives the same r for the same packet index. With a zero key derivation
+// rate the RFC's "a DIV 0 = 0" convention applies and zero is always
+// returned, preserving the legacy single-key behavior. When r does not fit
+// into the 48-bit field of the key derivation input block the data is
+// rejected rather than protected with the wrong keys.
+func (c *Context) keyDerivationIndex(packetIndex uint64) (uint64, error) {
+	if c.keyDerivationRate == 0 {
+		return 0, nil
+	}
+
+	r := packetIndex / c.keyDerivationRate
+	if r > maxKeyDerivationRateIndex {
+		return 0, errKeyDerivationRateOverflow
+	}
+
+	return r, nil
 }
 
 func (c *Context) hasROCInPacket(header *rtp.Header, authTagLen int) (bool, int) {

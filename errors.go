@@ -20,7 +20,6 @@ var (
 	errShortSrtpMasterKey            = errors.New("SRTP master key is not long enough")
 	errShortSrtpMasterSalt           = errors.New("SRTP master salt is not long enough")
 	errNoSuchSRTPProfile             = errors.New("no such SRTP Profile")
-	errNonZeroKDRNotSupported        = errors.New("indexOverKdr > 0 is not supported yet")
 	errExporterWrongLabel            = errors.New("exporter called with wrong label")
 	errNoConfig                      = errors.New("no config provided")
 	errNoConn                        = errors.New("no conn provided")
@@ -48,6 +47,7 @@ var (
 	errHeaderLengthMismatch         = errors.New("header length mismatch")
 	errUnencryptedHeaderExtAndCSRCs = errors.New("unencrypted header extensions and CSRCs are not allowed")
 	errCryptexDisabled              = errors.New("cryptex is disabled")
+	errKeyDerivationRateOverflow    = errors.New("key derivation rate index (packet index DIV key derivation rate) exceeds 48 bits")
 )
 
 type duplicatedError struct {

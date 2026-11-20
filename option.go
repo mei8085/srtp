@@ -231,6 +231,42 @@ func SRTPAuthenticationTagLength(authTagRTPLen int) ContextOption { // nolint:re
 	}
 }
 
+// KeyDerivationRate sets the SRTP/SRTCP key derivation rate (kdr) from
+// RFC 3711 section 4.3.
+//
+// A zero rate (the default) keeps the legacy behavior: the session keys are
+// derived once from the master key and used for the whole lifetime of the
+// master key, so existing contexts and wire output stay unchanged.
+//
+// A non-zero rate enables periodic session key re-derivation. For every RTP
+// or RTCP packet the derivation index r = packet index DIV kdr is computed
+// from the direction's own packet index (the 48-bit ROC || SEQ index for
+// SRTP, the 31-bit SRTCP index for SRTCP), and the session keys used to
+// protect the packet are the keys derived for that r. RTP and RTCP maintain
+// independent derivation state but apply the same boundary rules, so packets
+// inside the replay window, index roll-overs and out-of-order packets always
+// select the keys they were originally protected with. Both communication
+// peers MUST configure the same rate: the sender and the receiver derive
+// identical keys for identical (label, r) pairs.
+//
+// The rate MUST be kept fixed for the lifetime of the associated master key
+// (RFC 3711 section 4.3.1), therefore this option can only be set during
+// context construction. If r cannot be encoded in the 48-bit field of the
+// key derivation input (for example because the packet index space has been
+// exhausted), the offending packet is rejected with an error instead of
+// being protected with an incorrect key.
+func KeyDerivationRate(keyDerivationRate uint64) ContextOption {
+	return func(c *Context) error {
+		if c.constructed {
+			return ErrContextOptionNotUpdatable
+		}
+
+		c.keyDerivationRate = keyDerivationRate
+
+		return nil
+	}
+}
+
 // Cryptex allows to enable Cryptex mechanism to completely encrypt RTP Header Extensions and Contributing
 // Sources, as defined in RFC 9335.
 func Cryptex(cryptexMode CryptexMode) ContextOption {

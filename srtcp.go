@@ -74,6 +74,16 @@ func (c *Context) decryptRTCP(dst, encrypted []byte) ([]byte, error) {
 		return nil, &duplicatedError{Proto: "srtcp", SSRC: ssrc, Index: index}
 	}
 
+	// RFC 3711 section 4.3.2 replaces the SRTP index by the 32-bit quantity
+	// 0 || SRTCP index (the E-bit excluded). The resulting value is at most
+	// 2^31 - 1, so r = index DIV kdr always fits into the 48-bit derivation
+	// field; the shared helper still applies the identical boundary rules as
+	// the RTP path and returns zero for a zero key derivation rate.
+	indexOverKdr, err := c.keyDerivationIndex(uint64(index))
+	if err != nil {
+		return nil, err
+	}
+
 	cipher := c.cipher
 	if len(c.mkis) > 0 {
 		// Find cipher for MKI
@@ -84,7 +94,7 @@ func (c *Context) decryptRTCP(dst, encrypted []byte) ([]byte, error) {
 		}
 	}
 
-	out, err := cipher.decryptRTCP(dst, encrypted, index, ssrc)
+	out, err := cipher.decryptRTCP(dst, encrypted, index, ssrc, indexOverKdr)
 	if err != nil {
 		return nil, err
 	}
@@ -134,7 +144,13 @@ func (c *Context) encryptRTCP(dst, decrypted []byte) ([]byte, error) {
 	// We roll over early because MSB is used for marking as encrypted
 	ssrcState.srtcpIndex++
 
-	return c.cipher.encryptRTCP(dst, decrypted, ssrcState.srtcpIndex, ssrc)
+	// RFC 3711 section 4.3.2: use 0 || SRTCP index as the derivation index.
+	indexOverKdr, err := c.keyDerivationIndex(uint64(ssrcState.srtcpIndex))
+	if err != nil {
+		return nil, err
+	}
+
+	return c.cipher.encryptRTCP(dst, decrypted, ssrcState.srtcpIndex, ssrc, indexOverKdr)
 }
 
 // EncryptRTCP Encrypts a RTCP packet.
